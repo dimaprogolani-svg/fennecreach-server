@@ -167,13 +167,34 @@ async def telegram_webhook(request: Request):
 
     if TELEGRAM_OWNER_CHAT_ID and chat_id != TELEGRAM_OWNER_CHAT_ID:
         return {"ok": True}
+
     if not text.startswith("/"):
+        tg_send(
+            "✅ FennecReach Bot на связи.\n"
+            "Сервер работает и получает сообщения.\n\n"
+            "Команды:\n"
+            "/start — проверить бота\n"
+            "/help — список команд"
+        )
         return {"ok": True}
 
     parts = text.split(maxsplit=2)
     cmd = parts[0].split("@")[0].lower()
 
-    if cmd == "/details" and len(parts) >= 3:
+    if cmd == "/start":
+        tg_send(
+            "🦊 FennecReach Bot запущен.\n\n"
+            "✅ Telegram подключён\n"
+            "✅ Сервер Render работает\n"
+            "✅ Заявки на покупку будут приходить сюда\n\n"
+            "Команды:\n"
+            "/details FR-XXXXXXXX ТЕКСТ — отправить пользователю реквизиты\n"
+            "/paid FR-XXXXXXXX — отметить оплату\n"
+            "/license FR-XXXXXXXX ЛИЦЕНЗИОННЫЙ_КОД — выдать лицензию\n"
+            "/help — помощь"
+        )
+
+    elif cmd == "/details" and len(parts) >= 3:
         with db() as con:
             cur = con.execute(
                 "UPDATE purchases SET payment_message=?, status=? WHERE request_id=?",
@@ -198,6 +219,15 @@ async def telegram_webhook(request: Request):
         tg_send("🔑 Лицензия отправлена пользователю." if cur.rowcount else "❌ Заявка не найдена.")
 
     elif cmd == "/help":
-        tg_send("/details FR-XXXXXXXX ТЕКСТ\n/paid FR-XXXXXXXX\n/license FR-XXXXXXXX КОД")
+        tg_send(
+            "FennecReach команды:\n\n"
+            "/start — проверить работу бота\n"
+            "/details FR-XXXXXXXX ТЕКСТ — отправить реквизиты пользователю\n"
+            "/paid FR-XXXXXXXX — отметить оплату\n"
+            "/license FR-XXXXXXXX КОД — передать лицензию пользователю"
+        )
+
+    else:
+        tg_send("Неизвестная команда. Отправь /help.")
 
     return {"ok": True}
