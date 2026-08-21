@@ -1,14 +1,15 @@
-import os, re, sqlite3, secrets
+import os, re, secrets
 from datetime import datetime, timezone
-from pathlib import Path
 from typing import Optional
 
 import requests
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from fastapi import FastAPI, HTTPException, Request
 from pydantic import BaseModel, Field
 
 APP_NAME = "FennecReach License Server"
-DB_PATH = Path(os.getenv("DB_PATH", "fennecreach.db"))
+DATABASE_URL = os.getenv("DATABASE_URL", "").strip()
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_OWNER_CHAT_ID = os.getenv("TELEGRAM_OWNER_CHAT_ID", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
@@ -20,22 +21,23 @@ def utc_now():
     return datetime.now(timezone.utc).isoformat()
 
 def db():
-    con = sqlite3.connect(DB_PATH)
-    con.row_factory = sqlite3.Row
-    return con
+    if not DATABASE_URL:
+        raise RuntimeError("DATABASE_URL is not configured")
+    return psycopg2.connect(DATABASE_URL, cursor_factory=RealDictCursor)
 
 def init_db():
     with db() as con:
-        con.execute("""CREATE TABLE IF NOT EXISTS purchases(
-            request_id TEXT PRIMARY KEY,
-            machine_id TEXT NOT NULL,
-            email TEXT,
-            app_version TEXT,
-            created_at TEXT NOT NULL,
-            status TEXT NOT NULL,
-            payment_message TEXT,
-            license_code TEXT
-        )""")
+        with con.cursor() as cur:
+            cur.execute("""CREATE TABLE IF NOT EXISTS purchases(
+                request_id TEXT PRIMARY KEY,
+                machine_id TEXT NOT NULL,
+                email TEXT,
+                app_version TEXT,
+                created_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payment_message TEXT,
+                license_code TEXT
+            )""")
         con.commit()
 
 @app.on_event("startup")
@@ -81,11 +83,12 @@ def purchase_request(data: PurchaseRequest):
     request_id = "FR-" + secrets.token_hex(4).upper()
 
     with db() as con:
-        con.execute(
-            "INSERT INTO purchases VALUES (?,?,?,?,?,?,?,?)",
-            (request_id, machine_id, data.email or "", data.app_version or "",
-             utc_now(), "waiting_payment_details", "", "")
-        )
+        with con.cursor() as cur:
+            cur.execute(
+                "INSERT INTO purchases VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                (request_id, machine_id, data.email or "", data.app_version or "",
+                 utc_now(), "waiting_payment_details", "", "")
+            )
         con.commit()
 
     text = (
@@ -112,7 +115,9 @@ def purchase_request(data: PurchaseRequest):
 @app.get("/purchase/status/{request_id}")
 def purchase_status(request_id: str):
     with db() as con:
-        row = con.execute("SELECT * FROM purchases WHERE request_id=?", (request_id.strip(),)).fetchone()
+        with con.cursor() as cur:
+            cur.execute("SELECT * FROM purchases WHERE request_id=%s", (request_id.strip(),))
+            row = cur.fetchone()
     if not row:
         raise HTTPException(404, "Request not found")
     return {
@@ -133,11 +138,13 @@ def require_admin(request: Request):
 def admin_payment(request_id: str, data: PaymentUpdate, request: Request):
     require_admin(request)
     with db() as con:
-        cur = con.execute(
-            "UPDATE purchases SET payment_message=?, status=? WHERE request_id=?",
-            (data.message.strip(), "payment_details_ready", request_id.strip()))
+        with con.cursor() as cur:
+            cur.execute(
+                "UPDATE purchases SET payment_message=%s, status=%s WHERE request_id=%s",
+                (data.message.strip(), "payment_details_ready", request_id.strip()))
+            changed = cur.rowcount
         con.commit()
-    if cur.rowcount == 0:
+    if changed == 0:
         raise HTTPException(404, "Request not found")
     return {"ok": True}
 
@@ -145,11 +152,13 @@ def admin_payment(request_id: str, data: PaymentUpdate, request: Request):
 def admin_license(request_id: str, data: LicenseUpdate, request: Request):
     require_admin(request)
     with db() as con:
-        cur = con.execute(
-            "UPDATE purchases SET license_code=?, status=? WHERE request_id=?",
-            (data.license_code.strip(), "license_ready", request_id.strip()))
+        with con.cursor() as cur:
+            cur.execute(
+                "UPDATE purchases SET license_code=%s, status=%s WHERE request_id=%s",
+                (data.license_code.strip(), "license_ready", request_id.strip()))
+            changed = cur.rowcount
         con.commit()
-    if cur.rowcount == 0:
+    if changed == 0:
         raise HTTPException(404, "Request not found")
     return {"ok": True}
 
@@ -196,27 +205,33 @@ async def telegram_webhook(request: Request):
 
     elif cmd == "/details" and len(parts) >= 3:
         with db() as con:
-            cur = con.execute(
-                "UPDATE purchases SET payment_message=?, status=? WHERE request_id=?",
-                (parts[2].strip(), "payment_details_ready", parts[1].strip()))
+            with con.cursor() as cur:
+                cur.execute(
+                    "UPDATE purchases SET payment_message=%s, status=%s WHERE request_id=%s",
+                    (parts[2].strip(), "payment_details_ready", parts[1].strip()))
+                changed = cur.rowcount
             con.commit()
-        tg_send("✅ Реквизиты отправлены в FennecReach." if cur.rowcount else "❌ Заявка не найдена.")
+        tg_send("✅ Реквизиты отправлены в FennecReach." if changed else "❌ Заявка не найдена.")
 
     elif cmd == "/paid" and len(parts) >= 2:
         with db() as con:
-            cur = con.execute(
-                "UPDATE purchases SET status=? WHERE request_id=?",
-                ("payment_confirmed", parts[1].strip()))
+            with con.cursor() as cur:
+                cur.execute(
+                    "UPDATE purchases SET status=%s WHERE request_id=%s",
+                    ("payment_confirmed", parts[1].strip()))
+                changed = cur.rowcount
             con.commit()
-        tg_send("✅ Оплата отмечена." if cur.rowcount else "❌ Заявка не найдена.")
+        tg_send("✅ Оплата отмечена." if changed else "❌ Заявка не найдена.")
 
     elif cmd == "/license" and len(parts) >= 3:
         with db() as con:
-            cur = con.execute(
-                "UPDATE purchases SET license_code=?, status=? WHERE request_id=?",
-                (parts[2].strip(), "license_ready", parts[1].strip()))
+            with con.cursor() as cur:
+                cur.execute(
+                    "UPDATE purchases SET license_code=%s, status=%s WHERE request_id=%s",
+                    (parts[2].strip(), "license_ready", parts[1].strip()))
+                changed = cur.rowcount
             con.commit()
-        tg_send("🔑 Лицензия отправлена пользователю." if cur.rowcount else "❌ Заявка не найдена.")
+        tg_send("🔑 Лицензия отправлена пользователю." if changed else "❌ Заявка не найдена.")
 
     elif cmd == "/help":
         tg_send(
