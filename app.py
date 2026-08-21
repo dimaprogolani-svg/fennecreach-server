@@ -39,8 +39,10 @@ def init_db():
                 created_at TEXT NOT NULL,
                 status TEXT NOT NULL,
                 payment_message TEXT,
-                license_code TEXT
+                license_code TEXT,
+                payment_proof TEXT
             )""")
+            cur.execute("ALTER TABLE purchases ADD COLUMN IF NOT EXISTS payment_proof TEXT")
         con.commit()
 
 @app.on_event("startup")
@@ -77,6 +79,9 @@ class PaymentUpdate(BaseModel):
 class LicenseUpdate(BaseModel):
     license_code: str = Field(min_length=8, max_length=10000)
 
+class PaymentProof(BaseModel):
+    proof: str = Field(min_length=3, max_length=4000)
+
 @app.get("/")
 def root():
     return {"ok": True, "service": APP_NAME, "version": "1.0.0"}
@@ -96,9 +101,11 @@ def purchase_request(data: PurchaseRequest):
     with db() as con:
         with con.cursor() as cur:
             cur.execute(
-                "INSERT INTO purchases VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
+                """INSERT INTO purchases
+                   (request_id,machine_id,email,app_version,created_at,status,payment_message,license_code,payment_proof)
+                   VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s)""",
                 (request_id, machine_id, data.email or "", data.app_version or "",
-                 utc_now(), "payment_details_ready", payment_message(), "")
+                 utc_now(), "payment_details_ready", payment_message(), "", "")
             )
         con.commit()
 
@@ -146,7 +153,52 @@ def purchase_status(request_id: str):
         "payment_address": PAYMENT_TRC20_ADDRESS,
         "payment_price_usdt": PAYMENT_PRICE_USDT,
         "payment_network": PAYMENT_NETWORK,
+        "payment_proof": row.get("payment_proof") or "",
         "license_code": row["license_code"] or ""
+    }
+
+@app.post("/purchase/confirm/{request_id}")
+def purchase_confirm(request_id: str, data: PaymentProof):
+    request_id = request_id.strip()
+    proof = data.proof.strip()
+
+    with db() as con:
+        with con.cursor() as cur:
+            cur.execute(
+                """UPDATE purchases
+                   SET payment_proof=%s, status=%s
+                   WHERE request_id=%s
+                   RETURNING machine_id,email,app_version""",
+                (proof, "payment_proof_sent", request_id)
+            )
+            row = cur.fetchone()
+        con.commit()
+
+    if not row:
+        raise HTTPException(404, "Request not found")
+
+    try:
+        tg_send(
+            "💳 ПОДТВЕРЖДЕНИЕ ОПЛАТЫ FennecReach\n\n"
+            f"Заявка: {request_id}\n"
+            f"Код ПК: {row['machine_id']}\n"
+            f"Email: {row['email'] or '-'}\n"
+            f"Версия: {row['app_version'] or '-'}\n\n"
+            "Подтверждение / TxID:\n"
+            f"{proof}\n\n"
+            "После проверки:\n"
+            f"/paid {request_id}\n"
+            f"/license {request_id} ЛИЦЕНЗИОННЫЙ_КОД"
+        )
+        sent = True
+    except Exception:
+        sent = False
+
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "status": "payment_proof_sent",
+        "telegram_sent": sent,
     }
 
 def require_admin(request: Request):
@@ -218,7 +270,7 @@ async def telegram_webhook(request: Request):
             "✅ Сервер Render работает\n"
             "✅ Заявки на покупку будут приходить сюда\n\n"
             "Команды:\n"
-            "/paid FR-XXXXXXXX — отметить оплату\n"
+            "/paid FR-XXXXXXXX — подтвердить полученную оплату\n"
             "/license FR-XXXXXXXX ЛИЦЕНЗИОННЫЙ_КОД — выдать лицензию\n"
             "/help — помощь"
         )
@@ -257,7 +309,7 @@ async def telegram_webhook(request: Request):
         tg_send(
             "FennecReach команды:\n\n"
             "/start — проверить работу бота\n"
-            "/paid FR-XXXXXXXX — отметить оплату\n"
+            "/paid FR-XXXXXXXX — подтвердить полученную оплату\n"
             "/license FR-XXXXXXXX КОД — передать лицензию пользователю"
         )
 
