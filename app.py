@@ -14,6 +14,9 @@ TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
 TELEGRAM_OWNER_CHAT_ID = os.getenv("TELEGRAM_OWNER_CHAT_ID", "").strip()
 TELEGRAM_WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET", "").strip()
 ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
+PAYMENT_TRC20_ADDRESS = os.getenv("PAYMENT_TRC20_ADDRESS", "TUYstja5qm4abCciKfxfB6uEE7y6xDKAJV").strip()
+PAYMENT_PRICE_USDT = os.getenv("PAYMENT_PRICE_USDT", "99").strip()
+PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "TRON (TRC20)").strip()
 
 app = FastAPI(title=APP_NAME, version="1.0.0")
 
@@ -43,6 +46,14 @@ def init_db():
 @app.on_event("startup")
 def startup():
     init_db()
+
+def payment_message():
+    return (
+        f"Сумма: {PAYMENT_PRICE_USDT} USDT\n"
+        f"Сеть: {PAYMENT_NETWORK}\n"
+        f"Адрес: {PAYMENT_TRC20_ADDRESS}\n\n"
+        "Отправляйте только USDT в сети TRON (TRC20)."
+    )
 
 def tg_send(text):
     if not TELEGRAM_BOT_TOKEN or not TELEGRAM_OWNER_CHAT_ID:
@@ -87,7 +98,7 @@ def purchase_request(data: PurchaseRequest):
             cur.execute(
                 "INSERT INTO purchases VALUES (%s,%s,%s,%s,%s,%s,%s,%s)",
                 (request_id, machine_id, data.email or "", data.app_version or "",
-                 utc_now(), "waiting_payment_details", "", "")
+                 utc_now(), "payment_details_ready", payment_message(), "")
             )
         con.commit()
 
@@ -97,8 +108,8 @@ def purchase_request(data: PurchaseRequest):
         f"Код ПК: {machine_id}\n"
         f"Email: {data.email or '-'}\n"
         f"Версия: {data.app_version or '-'}\n\n"
+        "Реквизиты уже показаны покупателю автоматически.\n\n"
         "Команды:\n"
-        f"/details {request_id} ТЕКСТ_РЕКВИЗИТОВ\n"
         f"/paid {request_id}\n"
         f"/license {request_id} ЛИЦЕНЗИОННЫЙ_КОД"
     )
@@ -108,9 +119,16 @@ def purchase_request(data: PurchaseRequest):
     except Exception:
         sent = False
 
-    return {"ok": True, "request_id": request_id,
-            "status": "waiting_payment_details",
-            "telegram_sent": sent}
+    return {
+        "ok": True,
+        "request_id": request_id,
+        "status": "payment_details_ready",
+        "payment_message": payment_message(),
+        "payment_address": PAYMENT_TRC20_ADDRESS,
+        "payment_price_usdt": PAYMENT_PRICE_USDT,
+        "payment_network": PAYMENT_NETWORK,
+        "telegram_sent": sent,
+    }
 
 @app.get("/purchase/status/{request_id}")
 def purchase_status(request_id: str):
@@ -124,7 +142,10 @@ def purchase_status(request_id: str):
         "ok": True,
         "request_id": row["request_id"],
         "status": row["status"],
-        "payment_message": row["payment_message"] or "",
+        "payment_message": row["payment_message"] or payment_message(),
+        "payment_address": PAYMENT_TRC20_ADDRESS,
+        "payment_price_usdt": PAYMENT_PRICE_USDT,
+        "payment_network": PAYMENT_NETWORK,
         "license_code": row["license_code"] or ""
     }
 
@@ -197,7 +218,6 @@ async def telegram_webhook(request: Request):
             "✅ Сервер Render работает\n"
             "✅ Заявки на покупку будут приходить сюда\n\n"
             "Команды:\n"
-            "/details FR-XXXXXXXX ТЕКСТ — отправить пользователю реквизиты\n"
             "/paid FR-XXXXXXXX — отметить оплату\n"
             "/license FR-XXXXXXXX ЛИЦЕНЗИОННЫЙ_КОД — выдать лицензию\n"
             "/help — помощь"
@@ -237,7 +257,6 @@ async def telegram_webhook(request: Request):
         tg_send(
             "FennecReach команды:\n\n"
             "/start — проверить работу бота\n"
-            "/details FR-XXXXXXXX ТЕКСТ — отправить реквизиты пользователю\n"
             "/paid FR-XXXXXXXX — отметить оплату\n"
             "/license FR-XXXXXXXX КОД — передать лицензию пользователю"
         )
