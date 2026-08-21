@@ -17,6 +17,7 @@ ADMIN_API_KEY = os.getenv("ADMIN_API_KEY", "").strip()
 PAYMENT_TRC20_ADDRESS = os.getenv("PAYMENT_TRC20_ADDRESS", "TUYstja5qm4abCciKfxfB6uEE7y6xDKAJV").strip()
 PAYMENT_PRICE_USDT = os.getenv("PAYMENT_PRICE_USDT", "99").strip()
 PAYMENT_NETWORK = os.getenv("PAYMENT_NETWORK", "TRON (TRC20)").strip()
+LICENSE_PRIVATE_KEY_FILE = os.getenv("LICENSE_PRIVATE_KEY_FILE", "/etc/secrets/OWNER_PRIVATE_KEY.pem").strip()
 
 app = FastAPI(title=APP_NAME, version="1.0.0")
 
@@ -48,6 +49,57 @@ def init_db():
 @app.on_event("startup")
 def startup():
     init_db()
+
+def _b64u(data: bytes) -> str:
+    return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
+
+def generate_license_code(machine_id_value: str) -> str:
+    key_path = Path(LICENSE_PRIVATE_KEY_FILE)
+    if not key_path.exists():
+        raise RuntimeError(
+            f"Закрытый ключ лицензии не найден: {LICENSE_PRIVATE_KEY_FILE}"
+        )
+
+    from cryptography.hazmat.primitives import hashes, serialization
+    from cryptography.hazmat.primitives.asymmetric import ed25519, ed448, rsa, ec, padding
+
+    private_key = serialization.load_pem_private_key(
+        key_path.read_bytes(),
+        password=None,
+    )
+
+    payload = {
+        "product": "FennecReach",
+        "machine_id": machine_id_value.strip(),
+        "license": "FULL",
+        "issued_at": utc_now(),
+    }
+    payload_raw = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+    if isinstance(private_key, (ed25519.Ed25519PrivateKey, ed448.Ed448PrivateKey)):
+        signature = private_key.sign(payload_raw)
+    elif isinstance(private_key, rsa.RSAPrivateKey):
+        signature = private_key.sign(
+            payload_raw,
+            padding.PKCS1v15(),
+            hashes.SHA256(),
+        )
+    elif isinstance(private_key, ec.EllipticCurvePrivateKey):
+        signature = private_key.sign(
+            payload_raw,
+            ec.ECDSA(hashes.SHA256()),
+        )
+    else:
+        raise RuntimeError(
+            f"Неподдерживаемый тип закрытого ключа: {type(private_key).__name__}"
+        )
+
+    return _b64u(payload_raw) + "." + _b64u(signature)
 
 def payment_message():
     return (
@@ -149,7 +201,7 @@ def purchase_status(request_id: str):
         "ok": True,
         "request_id": row["request_id"],
         "status": row["status"],
-        "payment_message": row["payment_message"] or payment_message(),
+        "payment_message": payment_message(),
         "payment_address": PAYMENT_TRC20_ADDRESS,
         "payment_price_usdt": PAYMENT_PRICE_USDT,
         "payment_network": PAYMENT_NETWORK,
@@ -186,9 +238,9 @@ def purchase_confirm(request_id: str, data: PaymentProof):
             f"Версия: {row['app_version'] or '-'}\n\n"
             "Подтверждение / TxID:\n"
             f"{proof}\n\n"
-            "После проверки:\n"
-            f"/paid {request_id}\n"
-            f"/license {request_id} ЛИЦЕНЗИОННЫЙ_КОД"
+            "После проверки оплаты отправьте:\n"
+            f"/paid {request_id}\n\n"
+            "После /paid сервер сам создаст и выдаст настоящую FULL-лицензию."
         )
         sent = True
     except Exception:
@@ -271,7 +323,6 @@ async def telegram_webhook(request: Request):
             "✅ Заявки на покупку будут приходить сюда\n\n"
             "Команды:\n"
             "/paid FR-XXXXXXXX — подтвердить полученную оплату\n"
-            "/license FR-XXXXXXXX ЛИЦЕНЗИОННЫЙ_КОД — выдать лицензию\n"
             "/help — помощь"
         )
 
@@ -286,14 +337,42 @@ async def telegram_webhook(request: Request):
         tg_send("✅ Реквизиты отправлены в FennecReach." if changed else "❌ Заявка не найдена.")
 
     elif cmd == "/paid" and len(parts) >= 2:
-        with db() as con:
-            with con.cursor() as cur:
-                cur.execute(
-                    "UPDATE purchases SET status=%s WHERE request_id=%s",
-                    ("payment_confirmed", parts[1].strip()))
-                changed = cur.rowcount
-            con.commit()
-        tg_send("✅ Оплата отмечена." if changed else "❌ Заявка не найдена.")
+        request_id = parts[1].strip()
+        try:
+            with db() as con:
+                with con.cursor() as cur:
+                    cur.execute(
+                        "SELECT machine_id,email FROM purchases WHERE request_id=%s",
+                        (request_id,)
+                    )
+                    row = cur.fetchone()
+
+                    if not row:
+                        tg_send("❌ Заявка не найдена.")
+                        return {"ok": True}
+
+                    license_code = generate_license_code(row["machine_id"])
+
+                    cur.execute(
+                        """UPDATE purchases
+                           SET status=%s, license_code=%s
+                           WHERE request_id=%s""",
+                        ("license_ready", license_code, request_id)
+                    )
+                con.commit()
+
+            tg_send(
+                "✅ Оплата подтверждена.\n"
+                "🔑 Настоящая лицензия FULL создана автоматически и отправлена в FennecReach.\n\n"
+                f"Заявка: {request_id}\n"
+                f"Email: {row['email'] or '-'}"
+            )
+        except Exception as e:
+            tg_send(
+                "❌ Не удалось автоматически создать лицензию.\n\n"
+                f"Заявка: {request_id}\n"
+                f"Ошибка: {e}"
+            )
 
     elif cmd == "/license" and len(parts) >= 3:
         with db() as con:
@@ -310,7 +389,7 @@ async def telegram_webhook(request: Request):
             "FennecReach команды:\n\n"
             "/start — проверить работу бота\n"
             "/paid FR-XXXXXXXX — подтвердить полученную оплату\n"
-            "/license FR-XXXXXXXX КОД — передать лицензию пользователю"
+            "После /paid лицензия создаётся и выдаётся автоматически."
         )
 
     else:
