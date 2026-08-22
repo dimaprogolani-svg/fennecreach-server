@@ -1,5 +1,6 @@
 import os, re, secrets
 import json
+import base64
 from datetime import datetime, timezone
 from typing import Optional
 from pathlib import Path
